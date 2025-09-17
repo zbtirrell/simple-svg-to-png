@@ -1,5 +1,9 @@
 import SwiftUI
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
+import ResvgBridge
+
 
 /// Main view for the Simple SVG to PNG converter app
 /// This app allows users to load SVG files, preview them with a checkerboard background,
@@ -478,48 +482,40 @@ struct ContentView: View {
     /// Exports the current SVG as a PNG file using the resvg command-line tool
     /// Opens a save dialog and uses the current scale setting
     private func exportPNG() {
-        guard let inURL = svgURL else { return }
+        // Read SVG
+        guard let svgURL = svgURL,
+              let svg = try? Data(contentsOf: svgURL) else {
+            status = "Failed to read SVG."
+            return
+        }
 
-        // Configure save dialog
+        // Figure output size from baseSize * scale
+        guard let base = baseSize else {
+            status = "Unknown SVG size."
+            return
+        }
+        let outW = max(1, Int(base.width  * actualScale))
+        let outH = max(1, Int(base.height * actualScale))
+
+        // Save dialog (existing code stays)
         let save = NSSavePanel()
         save.allowedContentTypes = [.png]
         save.nameFieldStringValue =
-            inURL.deletingPathExtension().lastPathComponent +
+            svgURL.deletingPathExtension().lastPathComponent +
             "@\(String(format: actualScale >= 10.0 ? "%.0fx" : "%.1fx", actualScale)).png"
         if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
             save.directoryURL = downloads
         }
         guard save.runModal() == .OK, let outURL = save.url else { return }
 
-        // Locate the bundled resvg executable
-        guard let tool = Bundle.main.url(forResource: "resvg", withExtension: nil) else {
-            status = "resvg not found in bundle."
-            return
-        }
-
-        // Configure resvg command with zoom factor to preserve aspect ratio
-        let task = Process()
-        task.executableURL = tool
-        task.arguments = ["-z", String(actualScale), inURL.path, outURL.path]
-
-        // Capture error output for debugging
-        let pipe = Pipe()
-        task.standardError = pipe
-        
+        // Render and write
         do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            status = "Launch failed: \(error.localizedDescription)"
-            return
-        }
-
-        // Handle export result
-        if task.terminationStatus == 0 {
+            let cg = try resvgRenderImage(svg: svg, width: outW, height: outH)
+            let png = pngData(from: cg)
+            try png.write(to: outURL)
             status = "Saved \(outURL.lastPathComponent)."
-        } else {
-            let err = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "Unknown error"
-            status = "resvg failed: \(err.trimmingCharacters(in: .whitespacesAndNewlines))"
+        } catch {
+            status = "Render failed: \(error)"
         }
     }
 
@@ -532,60 +528,82 @@ struct ContentView: View {
         isGeneratingPreview = true
         previewImage = nil
 
-        // Create a temporary file for the preview PNG
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("png")
-
-        // Locate the bundled resvg executable
-        guard let tool = Bundle.main.url(forResource: "resvg", withExtension: nil) else {
-            status = "resvg not found in bundle."
-            isGeneratingPreview = false
-            return
-        }
-
-        // Configure resvg to render a 512px wide preview
-        let task = Process()
-        task.executableURL = tool
-        task.arguments = ["-w", "512", inURL.path, tmp.path]
-
-        let stderrPipe = Pipe()
-        task.standardError = stderrPipe
-
-        // Run preview generation on background queue to avoid blocking UI
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try task.run()
-                task.waitUntilExit()
+                let svg = try Data(contentsOf: inURL)
+
+                // Default preview width 512, preserve aspect if baseSize known
+                let targetW = 512
+                let targetH: Int
+                if let base = self.baseSize, base.width > 0 {
+                    targetH = Int(round(Double(targetW) * Double(base.height / base.width)))
+                } else {
+                    targetH = 512
+                }
+
+                let cg = try resvgRenderImage(svg: svg, width: targetW, height: targetH)
+                let nsImage = NSImage(cgImage: cg, size: .init(width: targetW, height: targetH))
+
+                DispatchQueue.main.async {
+                    self.previewImage = nsImage
+                    self.isGeneratingPreview = false
+                }
             } catch {
                 DispatchQueue.main.async {
-                    self.status = "Preview failed to launch: \(error.localizedDescription)"
-                    self.isGeneratingPreview = false
-                }
-                return
-            }
-
-            // Handle successful preview generation
-            if task.terminationStatus == 0, let img = NSImage(contentsOf: tmp) {
-                DispatchQueue.main.async {
-                    self.previewImage = img
-                    self.isGeneratingPreview = false
-                }
-            } else {
-                // Handle preview generation error
-                let err = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "Unknown error"
-                DispatchQueue.main.async {
-                    self.status = "Preview error: \(err.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    self.status = "Preview error: \(error)"
                     self.isGeneratingPreview = false
                 }
             }
-
-            // Clean up temporary file
-            try? FileManager.default.removeItem(at: tmp)
         }
     }
-
     
+}
+
+
+enum ResvgError: Error { case native(String) }
+
+private func lastNativeError() -> String {
+    var buf = [CChar](repeating: 0, count: 512)
+    let n = rb_last_error_copy(&buf, UInt(buf.count))
+    return n > 0 ? String(cString: buf) : "Unknown error"
+}
+
+/// Render to CGImage at a target pixel size (stretch scaling).
+func resvgRenderImage(svg: Data, width: Int, height: Int) throws -> CGImage {
+    let rb = svg.withUnsafeBytes { buf -> RBImage in
+        let p = buf.bindMemory(to: UInt8.self).baseAddress
+        return rb_render_svg_to_rgba(p, UInt(svg.count), UInt32(width), UInt32(height))
+    }
+    guard rb.ptr != nil, rb.len == width * height * 4 else {
+        throw ResvgError.native(lastNativeError())
+    }
+    defer { rb_free_image(rb) }
+
+    let cs = CGColorSpaceCreateDeviceRGB()
+    let bpr = width * 4
+    let provider = CGDataProvider(dataInfo: nil, data: rb.ptr, size: Int(rb.len), releaseData: { _,_,_ in })!
+    return CGImage(
+        width: Int(rb.width),
+        height: Int(rb.height),
+        bitsPerComponent: 8,
+        bitsPerPixel: 32,
+        bytesPerRow: bpr,
+        space: cs,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: true,
+        intent: .defaultIntent
+    )!
+}
+
+/// Convenience: encode CGImage to PNG data.
+func pngData(from cgImage: CGImage) -> Data {
+    let data = NSMutableData()
+    let dest = CGImageDestinationCreateWithData(data as CFMutableData, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    CGImageDestinationFinalize(dest)
+    return data as Data
 }
 
 
