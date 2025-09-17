@@ -1,0 +1,4 @@
+module ResvgBridge {
+  header "resvg_bridge.h"   // or: umbrella header "resvg_bridge.h"
+  export *
+}

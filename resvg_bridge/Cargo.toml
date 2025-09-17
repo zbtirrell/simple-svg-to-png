@@ -1,0 +1,18 @@
+[package]
+name = "resvg_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]  # static is simplest for codesign and symbolication
+
+[dependencies]
+resvg = "0.44"      # or latest compatible
+usvg = "0.44"
+tiny-skia = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
